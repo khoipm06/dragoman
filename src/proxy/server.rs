@@ -1,16 +1,16 @@
-use std::convert::Infallible;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use axum::{
+    Json, Router,
     extract::State,
     http::StatusCode,
     response::{
-        sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
     },
     routing::{get, post},
-    Json, Router,
 };
+use std::convert::Infallible;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info};
@@ -54,7 +54,10 @@ async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
 
     let models = vec![
         ModelObject {
@@ -97,7 +100,10 @@ async fn chat_completions(
 
     if is_stream {
         let stream_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
-        let created_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let created_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
 
         // Spawn prompt submission and streaming task via direct native HTTP RPC
         let client = state.web_client.clone();
@@ -194,7 +200,9 @@ async fn chat_completions(
             yield Ok::<Event, Infallible>(Event::default().data("[DONE]"));
         };
 
-        Ok(Sse::new(sse_stream).keep_alive(KeepAlive::default()).into_response())
+        Ok(Sse::new(sse_stream)
+            .keep_alive(KeepAlive::default())
+            .into_response())
     } else {
         match state.web_client.send_prompt_stream(&prompt, delta_tx).await {
             Ok(full_output) => {
@@ -208,13 +216,16 @@ async fn chat_completions(
                 let response = ChatCompletionResponse {
                     id: format!("chatcmpl-{}", Uuid::new_v4().simple()),
                     object: "chat.completion".to_string(),
-                    created: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                    created: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
                     model: request_model,
                     choices: vec![ChatChoice {
                         index: 0,
                         message: ChatMessage {
                             role: "assistant".to_string(),
-                            content: text_opt.map(|s| serde_json::Value::String(s)),
+                            content: text_opt.map(serde_json::Value::String),
                             name: None,
                             tool_calls: tool_calls_opt,
                             tool_call_id: None,

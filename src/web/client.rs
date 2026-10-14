@@ -1,9 +1,9 @@
+use futures::StreamExt;
+use reqwest::header::{CONTENT_TYPE, COOKIE, HeaderMap, HeaderValue, ORIGIN, REFERER, USER_AGENT};
+use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
-use futures::StreamExt;
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE, COOKIE, ORIGIN, REFERER, USER_AGENT};
-use serde_json::json;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tracing::{error, info};
 
 use crate::session::SessionData;
@@ -97,8 +97,14 @@ impl GeminiWebClient {
             HeaderValue::from_static("application/x-www-form-urlencoded;charset=UTF-8"),
         );
         headers.insert("X-Same-Domain", HeaderValue::from_static("1"));
-        headers.insert(ORIGIN, HeaderValue::from_static("https://gemini.google.com"));
-        headers.insert(REFERER, HeaderValue::from_static("https://gemini.google.com/"));
+        headers.insert(
+            ORIGIN,
+            HeaderValue::from_static("https://gemini.google.com"),
+        );
+        headers.insert(
+            REFERER,
+            HeaderValue::from_static("https://gemini.google.com/"),
+        );
         if let Ok(cookie_val) = HeaderValue::from_str(&cookie) {
             headers.insert(COOKIE, cookie_val);
         }
@@ -118,7 +124,10 @@ impl GeminiWebClient {
         if !status.is_success() {
             let error_text = response.text().await.unwrap_or_default();
             error!("Upstream Gemini returned HTTP {}: {}", status, error_text);
-            return Err(format!("Gemini Web returned HTTP {}: {}", status, error_text));
+            return Err(format!(
+                "Gemini Web returned HTTP {}: {}",
+                status, error_text
+            ));
         }
 
         let mut stream = response.bytes_stream();
@@ -137,33 +146,36 @@ impl GeminiWebClient {
                 let line = line_buffer[..newline_pos].trim().to_string();
                 line_buffer = line_buffer[newline_pos + 1..].to_string();
 
-                if line.is_empty() || line.starts_with(")]}'") || line.chars().all(|c| c.is_ascii_digit()) {
+                if line.is_empty()
+                    || line.starts_with(")]}'")
+                    || line.chars().all(|c| c.is_ascii_digit())
+                {
                     continue;
                 }
 
                 // Parse batch array
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-                    if let Some(arr) = val.as_array() {
-                        for item in arr {
-                            if let Some(entry) = item.as_array() {
-                                if entry.get(0).and_then(|v| v.as_str()) == Some("wrb.fr") {
-                                    if let Some(payload_str) = entry.get(2).and_then(|v| v.as_str()) {
-                                        if let Ok(inner_obj) = serde_json::from_str::<serde_json::Value>(payload_str) {
-                                            // Extract conversation & response IDs if present
-                                            if let Some(meta) = inner_obj.get(1).and_then(|m| m.as_array()) {
-                                                if let Some(cid) = meta.get(0).and_then(|s| s.as_str()) {
-                                                    new_conv_id = Some(cid.to_string());
-                                                }
-                                                if let Some(rid) = meta.get(1).and_then(|s| s.as_str()) {
-                                                    new_resp_id = Some(rid.to_string());
-                                                }
-                                            }
-
-                                            Self::extract_and_emit_delta(&inner_obj, &mut full_text, &delta_tx).await;
-                                        }
-                                    }
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line)
+                    && let Some(arr) = val.as_array()
+                {
+                    for item in arr {
+                        if let Some(entry) = item.as_array()
+                            && entry.first().and_then(|v| v.as_str()) == Some("wrb.fr")
+                            && let Some(payload_str) = entry.get(2).and_then(|v| v.as_str())
+                            && let Ok(inner_obj) =
+                                serde_json::from_str::<serde_json::Value>(payload_str)
+                        {
+                            // Extract conversation & response IDs if present
+                            if let Some(meta) = inner_obj.get(1).and_then(|m| m.as_array()) {
+                                if let Some(cid) = meta.first().and_then(|s| s.as_str()) {
+                                    new_conv_id = Some(cid.to_string());
+                                }
+                                if let Some(rid) = meta.get(1).and_then(|s| s.as_str()) {
+                                    new_resp_id = Some(rid.to_string());
                                 }
                             }
+
+                            Self::extract_and_emit_delta(&inner_obj, &mut full_text, &delta_tx)
+                                .await;
                         }
                     }
                 }
@@ -191,18 +203,15 @@ impl GeminiWebClient {
         delta_tx: &mpsc::Sender<String>,
     ) {
         // In StreamGenerate payload, candidate text is at val[4][0][1][0]
-        if let Some(candidates) = val.get(4).and_then(|c| c.as_array()) {
-            if let Some(first_candidate) = candidates.get(0) {
-                if let Some(text_entry) = first_candidate.get(1).and_then(|t| t.as_array()) {
-                    if let Some(new_content) = text_entry.get(0).and_then(|s| s.as_str()) {
-                        if new_content.len() > full_text.len() {
-                            let delta = &new_content[full_text.len()..];
-                            let _ = delta_tx.send(delta.to_string()).await;
-                            *full_text = new_content.to_string();
-                        }
-                    }
-                }
-            }
+        if let Some(candidates) = val.get(4).and_then(|c| c.as_array())
+            && let Some(first_candidate) = candidates.first()
+            && let Some(text_entry) = first_candidate.get(1).and_then(|t| t.as_array())
+            && let Some(new_content) = text_entry.first().and_then(|s| s.as_str())
+            && new_content.len() > full_text.len()
+        {
+            let delta = &new_content[full_text.len()..];
+            let _ = delta_tx.send(delta.to_string()).await;
+            *full_text = new_content.to_string();
         }
     }
 }

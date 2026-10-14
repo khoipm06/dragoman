@@ -4,14 +4,14 @@ mod proxy;
 mod session;
 mod web;
 
+use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use clap::{Parser, Subcommand};
 use tracing::{info, level_filters::LevelFilter};
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::browser::{BrowserLauncher, CdpClient};
-use crate::proxy::server::{create_router, AppState};
+use crate::proxy::server::{AppState, create_router};
 use crate::session::SessionData;
 use crate::web::GeminiWebClient;
 
@@ -69,14 +69,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!(" Dragoman - Native Gemini Web OpenAI Bridge");
             println!(" Target Model: {}", model);
             println!(" Mode: Standalone HTTP/2 Direct RPC (Zero Browser Runtime)");
-            println!(" Proxy Endpoint: http://127.0.0.1:{}/v1/chat/completions", port);
+            println!(
+                " Proxy Endpoint: http://127.0.0.1:{}/v1/chat/completions",
+                port
+            );
             println!("=======================================================\n");
 
             let session = match SessionData::load() {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("Error: {}", e);
-                    eprintln!("Please run 'dragoman login' first to authenticate with your Google AI Pro account.");
+                    eprintln!(
+                        "Please run 'dragoman login' first to authenticate with your Google AI Pro account."
+                    );
                     std::process::exit(1);
                 }
             };
@@ -96,35 +101,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Login { cdp_port } => {
             println!("=== Dragoman Initial Login & Credential Extraction ===");
-            println!("Ensuring Chrome is running with remote debugging on port {}...", cdp_port);
+            println!(
+                "Ensuring Chrome is running with remote debugging on port {}...",
+                cdp_port
+            );
 
-            BrowserLauncher::ensure_chrome_running(cdp_port, None).await
+            BrowserLauncher::ensure_chrome_running(cdp_port, None)
+                .await
                 .map_err(|e| format!("Failed to launch browser: {}", e))?;
 
             println!("Connecting to Chrome DevTools to extract session tokens...");
             let client = CdpClient::connect_to_gemini(cdp_port).await?;
 
             println!("Extracting session tokens (SNlM0e, FdrFJe, cfb2h) and cookies...");
-            let snlm0e = client.evaluate_js("window.WIZ_global_data?.SNlM0e || ''").await?
-                .as_str().unwrap_or("").to_string();
-            let f_sid = client.evaluate_js("window.WIZ_global_data?.FdrFJe || ''").await?
-                .as_str().unwrap_or("").to_string();
-            let bl = client.evaluate_js("window.WIZ_global_data?.cfb2h || ''").await?
-                .as_str().unwrap_or("").to_string();
+            let snlm0e = client
+                .evaluate_js("window.WIZ_global_data?.SNlM0e || ''")
+                .await?
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let f_sid = client
+                .evaluate_js("window.WIZ_global_data?.FdrFJe || ''")
+                .await?
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let bl = client
+                .evaluate_js("window.WIZ_global_data?.cfb2h || ''")
+                .await?
+                .as_str()
+                .unwrap_or("")
+                .to_string();
 
             if snlm0e.is_empty() {
-                eprintln!("\nWarning: Could not read SNlM0e. Please ensure you are logged in to https://gemini.google.com in the browser window.");
+                eprintln!(
+                    "\nWarning: Could not read SNlM0e. Please ensure you are logged in to https://gemini.google.com in the browser window."
+                );
                 return Ok(());
             }
 
             // Extract cookies via CDP
-            let cookies_val = client.call_cdp("Network.getCookies", serde_json::json!({
-                "urls": ["https://gemini.google.com"]
-            })).await?;
+            let cookies_val = client
+                .call_cdp(
+                    "Network.getCookies",
+                    serde_json::json!({
+                        "urls": ["https://gemini.google.com"]
+                    }),
+                )
+                .await?;
 
             let mut cookie_header = String::new();
-            if let Some(cookies) = cookies_val.get("result").and_then(|r| r.get("cookies")).and_then(|c| c.as_array()) {
-                let parts: Vec<String> = cookies.iter()
+            if let Some(cookies) = cookies_val
+                .get("result")
+                .and_then(|r| r.get("cookies"))
+                .and_then(|c| c.as_array())
+            {
+                let parts: Vec<String> = cookies
+                    .iter()
                     .filter_map(|c| {
                         let name = c.get("name")?.as_str()?;
                         let value = c.get("value")?.as_str()?;
@@ -151,8 +184,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Run 'dragoman serve' to launch the proxy without any browser running.");
         }
         Commands::TestRpc { prompt } => {
-            let session = SessionData::load()
-                .map_err(|e| format!("Could not load session: {}", e))?;
+            let session =
+                SessionData::load().map_err(|e| format!("Could not load session: {}", e))?;
             println!("Loaded session: bl={}, model={}", session.bl, session.model);
             let client = GeminiWebClient::new(session);
             let (tx, mut rx) = tokio::sync::mpsc::channel(100);

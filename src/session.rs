@@ -1,5 +1,5 @@
-use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionData {
@@ -57,8 +57,7 @@ impl SessionData {
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize session: {}", e))?;
 
-        std::fs::write(&path, json)
-            .map_err(|e| format!("Failed to write session file: {}", e))?;
+        std::fs::write(&path, json).map_err(|e| format!("Failed to write session file: {}", e))?;
 
         Ok(())
     }

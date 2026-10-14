@@ -6,7 +6,10 @@ use tracing::info;
 pub struct BrowserLauncher;
 
 impl BrowserLauncher {
-    pub async fn ensure_chrome_running(port: u16, profile_dir: Option<PathBuf>) -> Result<String, String> {
+    pub async fn ensure_chrome_running(
+        port: u16,
+        profile_dir: Option<PathBuf>,
+    ) -> Result<String, String> {
         if Self::is_cdp_ready(port).await {
             info!("Chrome CDP is already listening on port {}", port);
             return Ok(format!("http://127.0.0.1:{}", port));
@@ -14,9 +17,7 @@ impl BrowserLauncher {
 
         info!("Launching browser for authentication on port {}...", port);
 
-        let data_dir = profile_dir.unwrap_or_else(|| {
-            dirs_profile_dir()
-        });
+        let data_dir = profile_dir.unwrap_or_else(dirs_profile_dir);
 
         std::fs::create_dir_all(&data_dir)
             .map_err(|e| format!("Failed to create profile dir: {}", e))?;
@@ -59,7 +60,10 @@ impl BrowserLauncher {
         for _ in 0..30 {
             tokio::time::sleep(Duration::from_millis(500)).await;
             if Self::is_cdp_ready(port).await {
-                info!("Chrome launched and CDP is ready at http://127.0.0.1:{}", port);
+                info!(
+                    "Chrome launched and CDP is ready at http://127.0.0.1:{}",
+                    port
+                );
                 return Ok(format!("http://127.0.0.1:{}", port));
             }
         }
@@ -67,8 +71,16 @@ impl BrowserLauncher {
         Err(format!("Timed out waiting for Chrome CDP on port {}", port))
     }
 
-    fn spawn_native_chrome(port_flag: &str, user_data_flag: &str) -> std::io::Result<std::process::Child> {
-        let binaries = ["google-chrome-stable", "google-chrome", "chromium-browser", "chromium"];
+    fn spawn_native_chrome(
+        port_flag: &str,
+        user_data_flag: &str,
+    ) -> std::io::Result<std::process::Child> {
+        let binaries = [
+            "google-chrome-stable",
+            "google-chrome",
+            "chromium-browser",
+            "chromium",
+        ];
         for bin in binaries {
             if let Ok(child) = Command::new(bin)
                 .args([port_flag, user_data_flag, "https://gemini.google.com/app"])
