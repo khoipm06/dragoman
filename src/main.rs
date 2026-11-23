@@ -1,19 +1,12 @@
-mod browser;
-mod openai;
-mod proxy;
-mod session;
-mod web;
-
 use clap::{Parser, Subcommand};
+use dragoman::browser::{BrowserLauncher, CdpClient};
+use dragoman::proxy::server::{AppState, create_router};
+use dragoman::session::SessionData;
+use dragoman::web::GeminiWebClient;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{info, level_filters::LevelFilter};
 use tracing_subscriber::{EnvFilter, fmt};
-
-use crate::browser::{BrowserLauncher, CdpClient};
-use crate::proxy::server::{AppState, create_router};
-use crate::session::SessionData;
-use crate::web::GeminiWebClient;
 
 #[derive(Parser, Debug)]
 #[command(name = "dragoman")]

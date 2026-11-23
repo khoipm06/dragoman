@@ -26,6 +26,131 @@ impl GeminiWebClient {
         }
     }
 
+    pub fn session(&self) -> Arc<Mutex<SessionData>> {
+        self.session.clone()
+    }
+
+    pub async fn current_session(&self) -> SessionData {
+        self.session.lock().await.clone()
+    }
+
+    /// Build verified Gemini 4 Argon payload array (99 elements).
+    /// Slot 71 holds the conversation identifier array when present.
+    /// Slot 3 holds the previous response identifier when present.
+    pub fn build_stream_generate_payload(
+        prompt: &str,
+        conv_id: Option<&str>,
+        resp_id: Option<&str>,
+    ) -> Vec<serde_json::Value> {
+        let mut inner: Vec<serde_json::Value> = vec![serde_json::Value::Null; 99];
+        inner[0] = json!([prompt, 0, null, null, null, null, 0]);
+        inner[1] = json!(["en"]);
+        if let Some(rid) = resp_id {
+            inner[3] = json!(rid);
+        }
+        inner[6] = json!([1]);
+        inner[7] = json!(1);
+        inner[10] = json!(1);
+        inner[11] = json!(0);
+        inner[17] = json!([[2]]); // Enforce Argon (Argon4p0 / 4 Argon mode)
+        inner[18] = json!(0);
+        inner[27] = json!(1);
+        inner[30] = json!([4, 16, 19]);
+        inner[41] = json!([1]);
+        inner[49] = json!(0);
+        inner[53] = json!(0);
+        inner[61] = json!([]);
+        inner[67] = json!(0);
+        inner[68] = json!(2);
+        if let Some(cid) = conv_id {
+            inner[71] = json!([cid, null, null, null, null, null, null, null]);
+        }
+        inner[79] = json!(8);
+        inner[80] = json!(1);
+        inner[91] = json!(1);
+        inner[96] = json!(0);
+        inner[98] = json!(1);
+        inner
+    }
+
+    /// Build the f.req form envelope string containing the JSON-serialized payload array.
+    pub fn build_form_envelope(
+        prompt: &str,
+        conv_id: Option<&str>,
+        resp_id: Option<&str>,
+    ) -> String {
+        let inner = Self::build_stream_generate_payload(prompt, conv_id, resp_id);
+        let inner_json = serde_json::to_string(&inner).unwrap_or_default();
+        json!([null, inner_json]).to_string()
+    }
+
+    /// Parse a single line from an upstream StreamGenerate chunk.
+    /// Extracts (conversation_id, response_id, candidate_content) if present.
+    pub fn parse_wrb_fr_line(
+        line: &str,
+    ) -> Option<(Option<String>, Option<String>, Option<String>)> {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with(")]}'")
+            || trimmed.chars().all(|c| c.is_ascii_digit())
+        {
+            return None;
+        }
+
+        let val = serde_json::from_str::<serde_json::Value>(trimmed).ok()?;
+
+        let mut conv_id = None;
+        let mut resp_id = None;
+        let mut candidate_text = None;
+
+        let mut entries = Vec::new();
+        Self::collect_wrb_fr_entries(&val, &mut entries);
+
+        for entry in entries {
+            if let Some(payload_str) = entry.get(2).and_then(|v| v.as_str())
+                && let Ok(inner_obj) = serde_json::from_str::<serde_json::Value>(payload_str)
+            {
+                if let Some(meta) = inner_obj.get(1).and_then(|m| m.as_array()) {
+                    if let Some(cid) = meta.first().and_then(|s| s.as_str()) {
+                        conv_id = Some(cid.to_string());
+                    }
+                    if let Some(rid) = meta.get(1).and_then(|s| s.as_str()) {
+                        resp_id = Some(rid.to_string());
+                    }
+                }
+
+                if let Some(candidates) = inner_obj.get(4).and_then(|c| c.as_array())
+                    && let Some(first_candidate) = candidates.first()
+                    && let Some(text_entry) = first_candidate.get(1).and_then(|t| t.as_array())
+                    && let Some(content) = text_entry.first().and_then(|s| s.as_str())
+                {
+                    candidate_text = Some(content.to_string());
+                }
+            }
+        }
+
+        if conv_id.is_some() || resp_id.is_some() || candidate_text.is_some() {
+            Some((conv_id, resp_id, candidate_text))
+        } else {
+            None
+        }
+    }
+
+    fn collect_wrb_fr_entries<'a>(
+        val: &'a serde_json::Value,
+        out: &mut Vec<&'a Vec<serde_json::Value>>,
+    ) {
+        if let Some(arr) = val.as_array() {
+            if arr.first().and_then(|v| v.as_str()) == Some("wrb.fr") {
+                out.push(arr);
+            } else {
+                for item in arr {
+                    Self::collect_wrb_fr_entries(item, out);
+                }
+            }
+        }
+    }
+
     pub async fn send_prompt_stream(
         &self,
         prompt: &str,
@@ -54,38 +179,7 @@ impl GeminiWebClient {
             bl, f_sid, req_id
         );
 
-        // Build verified Gemini 4 Argon payload array (99 elements)
-        let mut inner: Vec<serde_json::Value> = vec![serde_json::Value::Null; 99];
-        inner[0] = json!([prompt, 0, null, null, null, null, 0]);
-        inner[1] = json!(["en"]);
-        if let Some(ref rid) = resp_id {
-            inner[3] = json!(rid);
-        }
-        inner[6] = json!([1]);
-        inner[7] = json!(1);
-        inner[10] = json!(1);
-        inner[11] = json!(0);
-        inner[17] = json!([[2]]); // Enforce Argon (Argon4p0 / 4 Argon mode)
-        inner[18] = json!(0);
-        inner[27] = json!(1);
-        inner[30] = json!([4, 16, 19]);
-        inner[41] = json!([1]);
-        inner[49] = json!(0);
-        inner[53] = json!(0);
-        inner[61] = json!([]);
-        inner[67] = json!(0);
-        inner[68] = json!(2);
-        if let Some(ref cid) = conv_id {
-            inner[71] = json!([cid, null, null, null, null, null, null, null]);
-        }
-        inner[79] = json!(8);
-        inner[80] = json!(1);
-        inner[91] = json!(1);
-        inner[96] = json!(0);
-        inner[98] = json!(1);
-
-        let inner_json = serde_json::to_string(&inner).unwrap_or_default();
-        let f_req = json!([null, inner_json]).to_string();
+        let f_req = Self::build_form_envelope(prompt, conv_id.as_deref(), resp_id.as_deref());
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -146,37 +240,19 @@ impl GeminiWebClient {
                 let line = line_buffer[..newline_pos].trim().to_string();
                 line_buffer = line_buffer[newline_pos + 1..].to_string();
 
-                if line.is_empty()
-                    || line.starts_with(")]}'")
-                    || line.chars().all(|c| c.is_ascii_digit())
-                {
-                    continue;
-                }
-
-                // Parse batch array
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line)
-                    && let Some(arr) = val.as_array()
-                {
-                    for item in arr {
-                        if let Some(entry) = item.as_array()
-                            && entry.first().and_then(|v| v.as_str()) == Some("wrb.fr")
-                            && let Some(payload_str) = entry.get(2).and_then(|v| v.as_str())
-                            && let Ok(inner_obj) =
-                                serde_json::from_str::<serde_json::Value>(payload_str)
-                        {
-                            // Extract conversation & response IDs if present
-                            if let Some(meta) = inner_obj.get(1).and_then(|m| m.as_array()) {
-                                if let Some(cid) = meta.first().and_then(|s| s.as_str()) {
-                                    new_conv_id = Some(cid.to_string());
-                                }
-                                if let Some(rid) = meta.get(1).and_then(|s| s.as_str()) {
-                                    new_resp_id = Some(rid.to_string());
-                                }
-                            }
-
-                            Self::extract_and_emit_delta(&inner_obj, &mut full_text, &delta_tx)
-                                .await;
-                        }
+                if let Some((cid_opt, rid_opt, content_opt)) = Self::parse_wrb_fr_line(&line) {
+                    if let Some(cid) = cid_opt {
+                        new_conv_id = Some(cid);
+                    }
+                    if let Some(rid) = rid_opt {
+                        new_resp_id = Some(rid);
+                    }
+                    if let Some(new_content) = content_opt
+                        && new_content.len() > full_text.len()
+                    {
+                        let delta = &new_content[full_text.len()..];
+                        let _ = delta_tx.send(delta.to_string()).await;
+                        full_text = new_content;
                     }
                 }
             }
@@ -195,23 +271,5 @@ impl GeminiWebClient {
         }
 
         Ok(full_text)
-    }
-
-    async fn extract_and_emit_delta(
-        val: &serde_json::Value,
-        full_text: &mut String,
-        delta_tx: &mpsc::Sender<String>,
-    ) {
-        // In StreamGenerate payload, candidate text is at val[4][0][1][0]
-        if let Some(candidates) = val.get(4).and_then(|c| c.as_array())
-            && let Some(first_candidate) = candidates.first()
-            && let Some(text_entry) = first_candidate.get(1).and_then(|t| t.as_array())
-            && let Some(new_content) = text_entry.first().and_then(|s| s.as_str())
-            && new_content.len() > full_text.len()
-        {
-            let delta = &new_content[full_text.len()..];
-            let _ = delta_tx.send(delta.to_string()).await;
-            *full_text = new_content.to_string();
-        }
     }
 }
