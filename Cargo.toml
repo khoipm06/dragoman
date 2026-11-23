@@ -6,7 +6,7 @@ authors = ["Khoi Pham Minh <khoipm06@gmail.com>"]
 description = "High-performance OpenAI-compatible proxy for Gemini Web (Gemini 4 Argon)"
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/khoipm/dragoman"
+repository = "https://github.com/khoipm06/dragoman"
 keywords = ["gemini", "gemini-4-argon", "openai-proxy", "llm", "ai-agents"]
 categories = ["command-line-utilities", "development-tools"]
 

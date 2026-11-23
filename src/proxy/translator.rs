@@ -78,44 +78,65 @@ impl PromptTranslator {
         let tool_call_tag_start = "<tool_call>";
         let tool_call_tag_end = "</tool_call>";
 
-        if let Some(start_idx) = content.find(tool_call_tag_start)
-            && let Some(end_idx) = content.find(tool_call_tag_end)
-        {
-            let json_slice = &content[start_idx + tool_call_tag_start.len()..end_idx].trim();
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_slice) {
-                let name = val
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                let args = val
-                    .get("arguments")
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "{}".to_string());
+        let mut tool_calls = Vec::new();
+        let mut clean_text = String::new();
+        let mut cursor = 0;
 
-                let tool_call = ToolCall {
-                    id: format!("call_{}", Uuid::new_v4().simple()),
-                    r#type: "function".to_string(),
-                    function: FunctionCall {
-                        name: name.to_string(),
-                        arguments: args,
-                    },
-                };
+        while let Some(start_rel) = content[cursor..].find(tool_call_tag_start) {
+            let start_idx = cursor + start_rel;
+            let after_start = start_idx + tool_call_tag_start.len();
 
-                let text_before = content[..start_idx].trim();
-                let text_after = content[end_idx + tool_call_tag_end.len()..].trim();
-                let remaining_text = format!("{} {}", text_before, text_after).trim().to_string();
+            if let Some(end_rel) = content[after_start..].find(tool_call_tag_end) {
+                let end_idx = after_start + end_rel;
+                let json_slice = content[after_start..end_idx].trim();
 
-                let text_opt = if remaining_text.is_empty() {
-                    None
-                } else {
-                    Some(remaining_text)
-                };
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_slice) {
+                    let name = val
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
 
-                return (text_opt, Some(vec![tool_call]));
+                    let args = match val.get("arguments") {
+                        Some(serde_json::Value::String(s)) => s.clone(),
+                        Some(v) => v.to_string(),
+                        None => "{}".to_string(),
+                    };
+
+                    tool_calls.push(ToolCall {
+                        id: format!("call_{}", Uuid::new_v4().simple()),
+                        r#type: "function".to_string(),
+                        function: FunctionCall {
+                            name: name.to_string(),
+                            arguments: args,
+                        },
+                    });
+
+                    clean_text.push_str(&content[cursor..start_idx]);
+                    cursor = end_idx + tool_call_tag_end.len();
+                    continue;
+                }
             }
+
+            clean_text.push_str(&content[cursor..after_start]);
+            cursor = after_start;
         }
 
-        (Some(content.to_string()), None)
+        clean_text.push_str(&content[cursor..]);
+        let trimmed_text = clean_text.trim();
+
+        let text_opt = if trimmed_text.is_empty() {
+            None
+        } else {
+            Some(trimmed_text.to_string())
+        };
+
+        let tools_opt = if tool_calls.is_empty() {
+            None
+        } else {
+            Some(tool_calls)
+        };
+
+        (text_opt, tools_opt)
     }
 }
 
@@ -151,5 +172,40 @@ mod tests {
         assert!(tool_calls.is_some());
         let calls = tool_calls.unwrap();
         assert_eq!(calls[0].function.name, "get_weather");
+    }
+
+    #[test]
+    fn test_parse_multiple_tool_calls() {
+        let input = "Calling two tools:\n<tool_call>{\"name\": \"tool_one\", \"arguments\": {\"a\": 1}}</tool_call>\nMiddle commentary\n<tool_call>{\"name\": \"tool_two\", \"arguments\": {\"b\": 2}}</tool_call>\nDone.";
+        let (text, tool_calls) = PromptTranslator::parse_response(input);
+        assert_eq!(
+            text,
+            Some("Calling two tools:\n\nMiddle commentary\n\nDone.".to_string())
+        );
+        assert!(tool_calls.is_some());
+        let calls = tool_calls.unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.name, "tool_one");
+        assert_eq!(calls[1].function.name, "tool_two");
+    }
+
+    #[test]
+    fn test_parse_tool_call_string_arguments() {
+        let input = r#"<tool_call>{"name": "fetch", "arguments": "{\"url\": \"https://example.com\"}"}</tool_call>"#;
+        let (text, tool_calls) = PromptTranslator::parse_response(input);
+        assert!(text.is_none());
+        let calls = tool_calls.unwrap();
+        assert_eq!(
+            calls[0].function.arguments,
+            r#"{"url": "https://example.com"}"#
+        );
+    }
+
+    #[test]
+    fn test_parse_tool_call_unclosed_tag() {
+        let input = "Text before <tool_call>{\"name\": \"broken\"} without end tag";
+        let (text, tool_calls) = PromptTranslator::parse_response(input);
+        assert_eq!(text, Some(input.to_string()));
+        assert!(tool_calls.is_none());
     }
 }

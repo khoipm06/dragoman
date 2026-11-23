@@ -8,6 +8,14 @@ use tracing::{error, info};
 
 use crate::session::SessionData;
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StreamChunkPayload {
+    pub conversation_id: Option<String>,
+    pub response_id: Option<String>,
+    pub choice_id: Option<String>,
+    pub candidate_text: Option<String>,
+}
+
 pub struct GeminiWebClient {
     session: Arc<Mutex<SessionData>>,
     http: reqwest::Client,
@@ -85,22 +93,19 @@ impl GeminiWebClient {
     }
 
     /// Parse a single line from an upstream StreamGenerate chunk.
-    /// Extracts (conversation_id, response_id, candidate_content) if present.
-    pub fn parse_wrb_fr_line(
-        line: &str,
-    ) -> Option<(Option<String>, Option<String>, Option<String>)> {
+    /// Extracts (conversation_id, response_id, choice_id, candidate_text) if present.
+    pub fn parse_wrb_fr_line(line: &str) -> Option<StreamChunkPayload> {
         let trimmed = line.trim();
-        if trimmed.is_empty()
-            || trimmed.starts_with(")]}'")
-            || trimmed.chars().all(|c| c.is_ascii_digit())
-        {
+        let stripped = trimmed.strip_prefix(")]}'").unwrap_or(trimmed).trim();
+        if stripped.is_empty() || stripped.chars().all(|c| c.is_ascii_digit()) {
             return None;
         }
 
-        let val = serde_json::from_str::<serde_json::Value>(trimmed).ok()?;
+        let val = serde_json::from_str::<serde_json::Value>(stripped).ok()?;
 
         let mut conv_id = None;
         let mut resp_id = None;
+        let mut choice_id = None;
         let mut candidate_text = None;
 
         let mut entries = Vec::new();
@@ -121,16 +126,27 @@ impl GeminiWebClient {
 
                 if let Some(candidates) = inner_obj.get(4).and_then(|c| c.as_array())
                     && let Some(first_candidate) = candidates.first()
-                    && let Some(text_entry) = first_candidate.get(1).and_then(|t| t.as_array())
-                    && let Some(content) = text_entry.first().and_then(|s| s.as_str())
                 {
-                    candidate_text = Some(content.to_string());
+                    if let Some(chid) = first_candidate.get(0).and_then(|c| c.as_str()) {
+                        choice_id = Some(chid.to_string());
+                    }
+                    if let Some(text_entry) = first_candidate.get(1).and_then(|t| t.as_array())
+                        && let Some(content) = text_entry.first().and_then(|s| s.as_str())
+                    {
+                        candidate_text = Some(content.to_string());
+                    }
                 }
             }
         }
 
-        if conv_id.is_some() || resp_id.is_some() || candidate_text.is_some() {
-            Some((conv_id, resp_id, candidate_text))
+        if conv_id.is_some() || resp_id.is_some() || choice_id.is_some() || candidate_text.is_some()
+        {
+            Some(StreamChunkPayload {
+                conversation_id: conv_id,
+                response_id: resp_id,
+                choice_id,
+                candidate_text,
+            })
         } else {
             None
         }
@@ -154,7 +170,7 @@ impl GeminiWebClient {
     pub async fn send_prompt_stream(
         &self,
         prompt: &str,
-        delta_tx: mpsc::Sender<String>,
+        delta_tx: mpsc::Sender<Result<String, String>>,
     ) -> Result<String, String> {
         let (snlm0e, f_sid, bl, cookie, conv_id, resp_id) = {
             let s = self.session.lock().await;
@@ -205,23 +221,29 @@ impl GeminiWebClient {
 
         info!("Sending native direct RPC to Gemini Web (StreamGenerate, Argon4p0)...");
 
-        let response = self
+        let response = match self
             .http
             .post(&url)
             .headers(headers)
             .form(&[("f.req", &f_req), ("at", &snlm0e)])
             .send()
             .await
-            .map_err(|e| format!("Direct RPC request failed: {}", e))?;
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                let err_msg = format!("Direct RPC request failed: {}", e);
+                let _ = delta_tx.send(Err(err_msg.clone())).await;
+                return Err(err_msg);
+            }
+        };
 
         let status = response.status();
         if !status.is_success() {
             let error_text = response.text().await.unwrap_or_default();
             error!("Upstream Gemini returned HTTP {}: {}", status, error_text);
-            return Err(format!(
-                "Gemini Web returned HTTP {}: {}",
-                status, error_text
-            ));
+            let err_msg = format!("Gemini Web returned HTTP {}: {}", status, error_text);
+            let _ = delta_tx.send(Err(err_msg.clone())).await;
+            return Err(err_msg);
         }
 
         let mut stream = response.bytes_stream();
@@ -230,36 +252,50 @@ impl GeminiWebClient {
 
         let mut new_conv_id: Option<String> = None;
         let mut new_resp_id: Option<String> = None;
+        let mut new_choice_id: Option<String> = None;
 
         while let Some(chunk_res) = stream.next().await {
-            let chunk = chunk_res.map_err(|e| format!("Stream read error: {}", e))?;
+            let chunk = match chunk_res {
+                Ok(c) => c,
+                Err(e) => {
+                    let err_msg = format!("Stream read error: {}", e);
+                    let _ = delta_tx.send(Err(err_msg.clone())).await;
+                    return Err(err_msg);
+                }
+            };
             let chunk_str = String::from_utf8_lossy(&chunk);
             line_buffer.push_str(&chunk_str);
 
             while let Some(newline_pos) = line_buffer.find('\n') {
-                let line = line_buffer[..newline_pos].trim().to_string();
-                line_buffer = line_buffer[newline_pos + 1..].to_string();
-
-                if let Some((cid_opt, rid_opt, content_opt)) = Self::parse_wrb_fr_line(&line) {
-                    if let Some(cid) = cid_opt {
-                        new_conv_id = Some(cid);
-                    }
-                    if let Some(rid) = rid_opt {
-                        new_resp_id = Some(rid);
-                    }
-                    if let Some(new_content) = content_opt
-                        && new_content.len() > full_text.len()
-                    {
-                        let delta = &new_content[full_text.len()..];
-                        let _ = delta_tx.send(delta.to_string()).await;
-                        full_text = new_content;
-                    }
-                }
+                let line: String = line_buffer[..newline_pos].trim().to_string();
+                line_buffer.drain(..=newline_pos);
+                Self::process_stream_line(
+                    &line,
+                    &mut full_text,
+                    &mut new_conv_id,
+                    &mut new_resp_id,
+                    &mut new_choice_id,
+                    &delta_tx,
+                )
+                .await;
             }
         }
 
+        let remaining = line_buffer.trim().to_string();
+        if !remaining.is_empty() {
+            Self::process_stream_line(
+                &remaining,
+                &mut full_text,
+                &mut new_conv_id,
+                &mut new_resp_id,
+                &mut new_choice_id,
+                &delta_tx,
+            )
+            .await;
+        }
+
         // Update session with conversation context if established
-        if new_conv_id.is_some() || new_resp_id.is_some() {
+        if new_conv_id.is_some() || new_resp_id.is_some() || new_choice_id.is_some() {
             let mut s = self.session.lock().await;
             if let Some(cid) = new_conv_id {
                 s.conversation_id = Some(cid);
@@ -267,9 +303,56 @@ impl GeminiWebClient {
             if let Some(rid) = new_resp_id {
                 s.response_id = Some(rid);
             }
+            if let Some(chid) = new_choice_id {
+                s.choice_id = Some(chid);
+            }
             let _ = s.save();
         }
 
         Ok(full_text)
+    }
+
+    async fn process_stream_line(
+        line: &str,
+        full_text: &mut String,
+        new_conv_id: &mut Option<String>,
+        new_resp_id: &mut Option<String>,
+        new_choice_id: &mut Option<String>,
+        delta_tx: &mpsc::Sender<Result<String, String>>,
+    ) {
+        if let Some(parsed) = Self::parse_wrb_fr_line(line) {
+            if let Some(cid) = parsed.conversation_id {
+                *new_conv_id = Some(cid);
+            }
+            if let Some(rid) = parsed.response_id {
+                *new_resp_id = Some(rid);
+            }
+            if let Some(chid) = parsed.choice_id {
+                *new_choice_id = Some(chid);
+            }
+            if let Some(new_content) = parsed.candidate_text {
+                let delta = if new_content.starts_with(full_text.as_str()) {
+                    new_content[full_text.len()..].to_string()
+                } else if full_text.is_empty() {
+                    new_content.clone()
+                } else {
+                    let common_len = full_text
+                        .chars()
+                        .zip(new_content.chars())
+                        .take_while(|(a, b)| a == b)
+                        .map(|(c, _)| c.len_utf8())
+                        .sum::<usize>();
+                    if new_content.len() > common_len {
+                        new_content[common_len..].to_string()
+                    } else {
+                        String::new()
+                    }
+                };
+                if !delta.is_empty() {
+                    let _ = delta_tx.send(Ok(delta)).await;
+                    *full_text = new_content;
+                }
+            }
+        }
     }
 }

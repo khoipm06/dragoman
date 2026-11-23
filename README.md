@@ -52,7 +52,7 @@ Real-Time Stream Parser
 Requirements: Rust edition 2024 (version 1.85 or later).
 
 ```bash
-git clone https://github.com/khoipm/dragoman.git
+git clone https://github.com/khoipm06/dragoman.git
 cd dragoman
 cargo build --release
 ```

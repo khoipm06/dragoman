@@ -185,9 +185,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             println!("Sending prompt: \"{}\"", prompt);
             tokio::spawn(async move {
-                while let Some(delta) = rx.recv().await {
-                    print!("{}", delta);
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                while let Some(res) = rx.recv().await {
+                    match res {
+                        Ok(delta) => {
+                            print!("{}", delta);
+                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                        }
+                        Err(e) => {
+                            eprintln!("\n[Stream Error]: {}", e);
+                        }
+                    }
                 }
             });
 

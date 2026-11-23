@@ -96,7 +96,7 @@ async fn chat_completions(
     let is_stream = req.stream.unwrap_or(false);
     let request_model = req.model.clone();
 
-    let (delta_tx, mut delta_rx) = mpsc::channel::<String>(100);
+    let (delta_tx, mut delta_rx) = mpsc::channel::<Result<String, String>>(100);
 
     if is_stream {
         let stream_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
@@ -135,28 +135,50 @@ async fn chat_completions(
             }
 
             let mut accumulated = String::new();
+            let mut stream_error = None;
 
-            while let Some(delta) = delta_rx.recv().await {
-                accumulated.push_str(&delta);
+            while let Some(res) = delta_rx.recv().await {
+                match res {
+                    Ok(delta) => {
+                        accumulated.push_str(&delta);
 
-                let chunk = ChatCompletionChunk {
-                    id: stream_id.clone(),
-                    object: "chat.completion.chunk".to_string(),
-                    created: created_at,
-                    model: request_model.clone(),
-                    choices: vec![ChunkChoice {
-                        index: 0,
-                        delta: ChunkDelta {
-                            role: None,
-                            content: Some(delta),
-                            tool_calls: None,
-                        },
-                        finish_reason: None,
-                    }],
-                };
-                if let Ok(json_str) = serde_json::to_string(&chunk) {
-                    yield Ok::<Event, Infallible>(Event::default().data(json_str));
+                        let chunk = ChatCompletionChunk {
+                            id: stream_id.clone(),
+                            object: "chat.completion.chunk".to_string(),
+                            created: created_at,
+                            model: request_model.clone(),
+                            choices: vec![ChunkChoice {
+                                index: 0,
+                                delta: ChunkDelta {
+                                    role: None,
+                                    content: Some(delta),
+                                    tool_calls: None,
+                                },
+                                finish_reason: None,
+                            }],
+                        };
+                        if let Ok(json_str) = serde_json::to_string(&chunk) {
+                            yield Ok::<Event, Infallible>(Event::default().data(json_str));
+                        }
+                    }
+                    Err(err) => {
+                        stream_error = Some(err);
+                        break;
+                    }
                 }
+            }
+
+            if let Some(err) = stream_error {
+                let err_payload = serde_json::json!({
+                    "error": {
+                        "message": err,
+                        "type": "upstream_error",
+                        "code": 500
+                    }
+                });
+                yield Ok::<Event, Infallible>(Event::default().event("error").data(err_payload.to_string()));
+                yield Ok::<Event, Infallible>(Event::default().data("[DONE]"));
+                return;
             }
 
             let (_, tool_calls) = PromptTranslator::parse_response(&accumulated);

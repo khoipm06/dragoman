@@ -77,10 +77,61 @@ fn test_wrb_fr_parsing_metadata_and_candidate() {
     let parsed = GeminiWebClient::parse_wrb_fr_line(line);
     assert!(parsed.is_some());
 
-    let (conv_id, resp_id, text) = parsed.unwrap();
-    assert_eq!(conv_id, Some("c_session_001".to_string()));
-    assert_eq!(resp_id, Some("r_turn_001".to_string()));
-    assert_eq!(text, Some("Gemini Argon output text".to_string()));
+    let payload = parsed.unwrap();
+    assert_eq!(payload.conversation_id, Some("c_session_001".to_string()));
+    assert_eq!(payload.response_id, Some("r_turn_001".to_string()));
+    assert_eq!(
+        payload.candidate_text,
+        Some("Gemini Argon output text".to_string())
+    );
+}
+
+#[test]
+fn test_wrb_fr_parsing_with_choice_id() {
+    let line = r#"[[["wrb.fr", null, "[\"ignored\", [\"c_session_002\", \"r_turn_002\"], null, null, [[\"rc_choice_999\", [\"Candidate with choice id\"]]]]"]]]"#;
+
+    let parsed = GeminiWebClient::parse_wrb_fr_line(line);
+    assert!(parsed.is_some());
+
+    let payload = parsed.unwrap();
+    assert_eq!(payload.conversation_id, Some("c_session_002".to_string()));
+    assert_eq!(payload.response_id, Some("r_turn_002".to_string()));
+    assert_eq!(payload.choice_id, Some("rc_choice_999".to_string()));
+    assert_eq!(
+        payload.candidate_text,
+        Some("Candidate with choice id".to_string())
+    );
+}
+
+#[test]
+fn test_wrb_fr_parsing_with_inline_xssi_prefix() {
+    let line = r#")]}'[[["wrb.fr", null, "[\"ignored\", [\"c_xssi\", \"r_xssi\"], null, null, [[null, [\"Parsed despite XSSI preamble\"]]]]"]]]"#;
+
+    let parsed = GeminiWebClient::parse_wrb_fr_line(line);
+    assert!(parsed.is_some());
+
+    let payload = parsed.unwrap();
+    assert_eq!(payload.conversation_id, Some("c_xssi".to_string()));
+    assert_eq!(payload.response_id, Some("r_xssi".to_string()));
+    assert_eq!(
+        payload.candidate_text,
+        Some("Parsed despite XSSI preamble".to_string())
+    );
+}
+
+#[test]
+fn test_wrb_fr_parsing_empty_candidates() {
+    let line =
+        r#"[[["wrb.fr", null, "[\"ignored\", [\"c_empty\", \"r_empty\"], null, null, []]"]]]"#;
+
+    let parsed = GeminiWebClient::parse_wrb_fr_line(line);
+    assert!(parsed.is_some());
+
+    let payload = parsed.unwrap();
+    assert_eq!(payload.conversation_id, Some("c_empty".to_string()));
+    assert_eq!(payload.response_id, Some("r_empty".to_string()));
+    assert!(payload.candidate_text.is_none());
+    assert!(payload.choice_id.is_none());
 }
 
 #[test]
@@ -115,17 +166,22 @@ async fn test_multi_turn_session_chaining_simulation() {
     assert!(t1_payload[3].is_null());
 
     // Upstream returns Turn 1 response with established conversation and response ID
-    let t1_upstream_chunk = r#"[[["wrb.fr", null, "[\"wrb.fr\", [\"c_us_history\", \"r_turn1_resp\"], null, null, [[null, [\"George Washington.\"]]]]"]]]"#;
-    let (t1_cid, t1_rid, t1_text) = GeminiWebClient::parse_wrb_fr_line(t1_upstream_chunk)
+    let t1_upstream_chunk = r#"[[["wrb.fr", null, "[\"wrb.fr\", [\"c_us_history\", \"r_turn1_resp\"], null, null, [[\"rc_turn1_choice\", [\"George Washington.\"]]]]"]]]"#;
+    let t1_res = GeminiWebClient::parse_wrb_fr_line(t1_upstream_chunk)
         .expect("Turn 1 upstream chunk must parse");
-    assert_eq!(t1_text, Some("George Washington.".to_string()));
+    assert_eq!(
+        t1_res.candidate_text,
+        Some("George Washington.".to_string())
+    );
 
     // Session update after Turn 1
-    session.conversation_id = t1_cid;
-    session.response_id = t1_rid;
+    session.conversation_id = t1_res.conversation_id;
+    session.response_id = t1_res.response_id;
+    session.choice_id = t1_res.choice_id;
 
     assert_eq!(session.conversation_id.as_deref(), Some("c_us_history"));
     assert_eq!(session.response_id.as_deref(), Some("r_turn1_resp"));
+    assert_eq!(session.choice_id.as_deref(), Some("rc_turn1_choice"));
 
     // --- Turn 2 ---
     let t2_payload = GeminiWebClient::build_stream_generate_payload(
@@ -142,24 +198,28 @@ async fn test_multi_turn_session_chaining_simulation() {
     assert_eq!(t2_payload[3], json!("r_turn1_resp"));
 
     // Upstream returns Turn 2 response, continuing the conversation with a new response ID
-    let t2_upstream_chunk = r#"[[["wrb.fr", null, "[\"wrb.fr\", [\"c_us_history\", \"r_turn2_resp\"], null, null, [[null, [\"He was born on February 22, 1732.\"]]]]"]]]"#;
-    let (t2_cid, t2_rid, t2_text) = GeminiWebClient::parse_wrb_fr_line(t2_upstream_chunk)
+    let t2_upstream_chunk = r#"[[["wrb.fr", null, "[\"wrb.fr\", [\"c_us_history\", \"r_turn2_resp\"], null, null, [[\"rc_turn2_choice\", [\"He was born on February 22, 1732.\"]]]]"]]]"#;
+    let t2_res = GeminiWebClient::parse_wrb_fr_line(t2_upstream_chunk)
         .expect("Turn 2 upstream chunk must parse");
     assert_eq!(
-        t2_text,
+        t2_res.candidate_text,
         Some("He was born on February 22, 1732.".to_string())
     );
 
     // Session update after Turn 2
-    if let Some(cid) = t2_cid {
+    if let Some(cid) = t2_res.conversation_id {
         session.conversation_id = Some(cid);
     }
-    if let Some(rid) = t2_rid {
+    if let Some(rid) = t2_res.response_id {
         session.response_id = Some(rid);
+    }
+    if let Some(chid) = t2_res.choice_id {
+        session.choice_id = Some(chid);
     }
 
     assert_eq!(session.conversation_id.as_deref(), Some("c_us_history"));
     assert_eq!(session.response_id.as_deref(), Some("r_turn2_resp"));
+    assert_eq!(session.choice_id.as_deref(), Some("rc_turn2_choice"));
 
     // --- Turn 3 ---
     let t3_payload = GeminiWebClient::build_stream_generate_payload(
@@ -207,4 +267,26 @@ fn test_session_serialization_backward_compatibility() {
     assert_eq!(deserialized.conversation_id.as_deref(), Some("c_conv_abc"));
     assert_eq!(deserialized.response_id.as_deref(), Some("r_resp_xyz"));
     assert_eq!(deserialized.choice_id.as_deref(), Some("rc_001"));
+}
+
+#[test]
+fn test_delta_char_boundary_utf8_vietnamese() {
+    let prev = "Xin chào các bạn";
+    let next_extend = "Xin chào các bạn, chúc một ngày tốt lành!";
+    assert!(next_extend.starts_with(prev));
+    let delta = &next_extend[prev.len()..];
+    assert_eq!(delta, ", chúc một ngày tốt lành!");
+
+    // Non-prefix replacement or correction with multi-byte characters
+    let prev2 = "Xin chào các bạn";
+    let next2 = "Xin chào mọi người";
+    let common_len = prev2
+        .chars()
+        .zip(next2.chars())
+        .take_while(|(a, b)| a == b)
+        .map(|(c, _)| c.len_utf8())
+        .sum::<usize>();
+    assert_eq!(&prev2[..common_len], "Xin chào ");
+    let delta2 = &next2[common_len..];
+    assert_eq!(delta2, "mọi người");
 }
